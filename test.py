@@ -110,14 +110,15 @@ def test_use():
         )
 
     got = first.prettyformat().strip()
+    print(got)
     expect = """
- Region[func] (env=$2, arg=$1) -> (env=$3, ret=$4) {
-   (env=$2, arg=$1) -> (env=$3, ret=$4) =>
-     Region[block] (env=$6, arg=$5) -> (env=$10, ret=$11) {
-       Op BinAdd2 (lhs=$5, rhs=$5) -> (out=$8)
-       Op BinAdd1 (lhs=$5, rhs=$8) -> (out=$7)
-       Op BinAdd3 (lhs=$7, rhs=$8) -> (out=$9)
-       Op Ret (env=$6, retval=$9) -> (env=$10, retval=$11)
+ Region[func] (env=$1, arg=$2) -> (env=$3, ret=$4) {
+   (env=$1, arg=$2) -> (env=$3, ret=$4) =>
+     Region[block] (env=$5, arg=$6) -> (env=$10, ret=$11) {
+       Op BinAdd2 (lhs=$6, rhs=$6) -> (out=$7)
+       Op BinAdd1 (lhs=$6, rhs=$7) -> (out=$8)
+       Op BinAdd3 (lhs=$8, rhs=$7) -> (out=$9)
+       Op Ret (env=$5, retval=$9) -> (env=$10, retval=$11)
      }
  }
 """.strip()
@@ -153,8 +154,8 @@ def test_copy_in():
     assert not check_overlap_refs(module_reg, func1, func2)
 
 def test_split():
-    module_reg = Region.make("module")
-    func_reg = module_reg.add_subregion(
+    parent_reg = Region.make("func")
+    func_reg = parent_reg.add_subregion(
         "func", name="foo", ins=["env", "arg"], outs=["env", "ret"]
     )
     binadd_op1 = func_reg.subregion.add_simple_op(
@@ -200,14 +201,26 @@ def test_split():
         env=func_reg.subregion.args.env,
         ret=binmul_op2.outs.out,
     )
-    module_reg.prettyprint()
+    # add source and sink that uses the above function op
+    source_op = parent_reg.add_simple_op(
+        "Source",
+        ins=(),
+        outs=("env", "val"),
+    )
+    source_op.outs.chain(func_reg.ins)
+    sink_op = parent_reg.add_simple_op(
+        "Sink",
+        ins=("env", "val"),
+        outs=(),
+    )
+    func_reg.outs.chain(sink_op.ins)
+    parent_reg.prettyprint()
 
     # Split region
     ops = list(func_reg.subregion.body.toposorted_ops())
     splitted = func_reg.subregion.split_after(ops[1])
-    func_reg.outs.bridge(splitted.ins)
 
-    module_reg.prettyprint()
+    parent_reg.prettyprint()
 
     assert False
 

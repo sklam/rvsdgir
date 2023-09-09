@@ -45,11 +45,11 @@ class _Ref:
         gs = self.storage()
         try:
             wrapper = gs.get_wrapper(self)
-        except KeyError:
-            typename = "?"
+        except OrphanNodeError:
+            desc = "?"
         else:
-            typename = type(wrapper).__name__
-        return f"Ref[{typename} ident={self.ident}]@0x{id(gs):x}"
+            desc = wrapper.short_description()
+        return f"Ref[{desc} ident={self.ident}]@0x{id(gs):x}"
 
 
 @dataclass(frozen=True, order=True)
@@ -79,9 +79,6 @@ class PortMap(Mapping, ABC):
     def __getattr__(self, name: str) -> Port:
         return self._get_port(name)
 
-    def connect(self, portname: str, incoming: Port):
-        target = self._get_port(portname)
-        self._get_storage().connect(incoming, target)
 
     def list_ports(self) -> list[Port]:
         return [
@@ -93,6 +90,10 @@ class PortMap(Mapping, ABC):
 
     def __iter__(self):
         return iter(self._get_attr_ports())
+
+    @abstractmethod
+    def connect(self, portname: str, port: Port):
+        raise NotImplementedError
 
     @abstractmethod
     def _get_attr_ports(self) -> tuple[str]:
@@ -133,6 +134,10 @@ class InputPorts(PortMap):
         attrs = self._get_storage().get_wrapper(self._ref).attrs
         return attrs.ins
 
+    def connect(self, portname, port):
+        target = self._get_port(portname)
+        self._get_storage().connect(port, target)
+
 
 class OutputPorts(PortMap):
     __slots__ = ("_ref",)
@@ -156,9 +161,13 @@ class OutputPorts(PortMap):
         attrs = self._get_storage().get_wrapper(self._ref).attrs
         return attrs.outs
 
-    def bridge(self, ports: InputPorts):
-        for k, inp in zip(self.keys(), ports.values(), strict=True):
-            self.connect(k, inp)
+    def chain(self, ports: InputPorts):
+        ports(**dict(zip(ports.keys(), self.values(), strict=True)))
+
+    def connect(self, portname, port):
+        source = self._get_port(portname)
+        self._get_storage().connect(source, port)
+
 
 
 def _forever_counter():
@@ -169,6 +178,8 @@ def _forever_counter():
 
 
 class VariableNamer:
+    _names: dict[Port, str]
+
     def __init__(self):
         self._names = {}
         self._counter = iter(_forever_counter())
@@ -178,23 +189,25 @@ class VariableNamer:
         name = f"${n}"
         return name
 
-    def load_edges(self, edges: Sequence["Edge"]):
-        # Bundle edges so they all have the same name
-        bundles: defaultdict[Port, set[Port]] = defaultdict(set)
-        for edge in sorted(edges):
+    def load_body(self, ordered_ports: Sequence["Port"], edges: Sequence["Edge"]):
+        port_order = dict(zip(ordered_ports, range(len(ordered_ports))))
+        MISSING = len(port_order)
+        edges = sorted(edges, key=lambda x: (port_order.get(x.target, MISSING),
+                                             port_order.get(x.source, MISSING)))
+        # Find aliases
+        alias: dict[Port, Port] = {}
+        for edge in edges:
             src = edge.source
             dst = edge.target
-            bundles[src].add(dst)
-            if dst in bundles:
-                bundles[src] |= bundles.pop(dst)
-
+            if src in port_order and dst in port_order:
+                # only live ports
+                alias[dst] = alias.get(src, src)
         # Assign names
-        for first, remains in bundles.items():
-            if first not in self._names:
-                self._names[first] = self._fresh_name()
-            name = self._names[first]
-            for v in remains:
-                self._names[v] = name
+        for port in port_order:
+            aliased = alias.get(port, port)
+            if aliased not in self._names:
+                self._names[aliased] = self._fresh_name()
+            self._names[port] = self._names[aliased]
 
     def get(self, port: Port) -> str:
         return self._names.get(port, "?")
@@ -202,12 +215,9 @@ class VariableNamer:
 
 class PrettyPrinter:
     @classmethod
-    def make(
-        cls, pp: Optional["PrettyPrinter"], storage: "GraphStorage"
-    ) -> "PrettyPrinter":
+    def get(cls, pp: Optional["PrettyPrinter"]) -> "PrettyPrinter":
         if pp is None:
             pp = PrettyPrinter(pp)
-            storage.assign_port_names(pp._varnamer)
         return pp
 
     def __init__(
@@ -221,8 +231,9 @@ class PrettyPrinter:
             varnamer = _varnamer
         self._varnamer = varnamer
 
-    def assign_port_names(self, storage: "GraphStorage"):
-        storage.assign_port_names(self._varnamer)
+    def load_region(self, region):
+        self._varnamer.load_body(region.body.toposorted_ports(),
+                                 region._storage._edges)
 
     def println(self, *args):
         print(self.indent, *args, file=self.file)
@@ -243,22 +254,27 @@ class PrettyPrinter:
 class OpNode:
     _ref: _Ref
 
+    @property
+    def ins(self):
+        return InputPorts(self._ref)
+
+    @property
+    def outs(self):
+        return OutputPorts(self._ref)
+
+
     def prettyprint(self, pp: PrettyPrinter):
         raise NotImplementedError
 
     @property
     def attrs(self):
-        gs = self._ref.storage()
-        return gs._nodes[self._ref]
+        return self._ref.storage().get_attrs(self._ref)
 
     def get_consuming_ports(self) -> set[Port]:
-        out = set()
         ports = self.ins.list_ports()
         gs = self._ref.storage()
-        for port in ports:
-            sources = gs.iter_edges().filter_by_target({port}).iter_sources()
-            out |= set(sources)
-        return out
+        sources = set(gs.iter_edges().filter_by_target(ports).iter_sources())
+        return sources
 
     def get_producing_ports(self) -> set[Port]:
         out = set()
@@ -268,6 +284,10 @@ class OpNode:
             targets = gs.iter_edges().filter_by_source({port}).iter_targets()
             out |= set(targets)
         return out
+
+    def short_description(self) -> str:
+        attrs = self.attrs
+        return f"{self.__class__.__name__}[{attrs.opname}]"
 
 
 @dataclass(frozen=True)
@@ -343,6 +363,9 @@ class Region:
             raise MalformOperationError("Region has no parent")
         return Region(parent, parent.get_root_region())
 
+    def get_regionop(self) -> "RegionOp":
+        return self._storage.get_parent_regionop(self._ref)
+
     def add_subregion(
         self, opname: str, ins: Sequence[str], outs: Sequence[str], **kwargs
     ) -> "RegionOp":
@@ -365,10 +388,6 @@ class Region:
     def split_after(self, op: OpNode) -> "RegionOp":
         """Split the region after the given ``OpNode`` returning the new
         second RegionOp.
-
-        The resulting graph does not contain interconnections between the
-        splitted regions. The original output edges will be orphaned.
-
         """
         gs = self._storage
         # Split the ops
@@ -378,6 +397,9 @@ class Region:
         after_ops = topo_ops[idx + 1:]
         parent = self.get_parent()
 
+        parent_op = parent._storage.get_wrapper(self.attrs.parent)
+        outedges = list(parent._storage.iter_edges().filter_by_source(set(parent_op.outs.list_ports())))
+
         second = parent.add_subregion(
             opname=self.attrs.opname, ins=(), outs=(),
             )
@@ -386,6 +408,12 @@ class Region:
         second_half = {x._ref for x in after_ops}
 
         gs.split(first_half, second_half, second.subregion)
+
+        # Fix edges
+        for edge in outedges:
+            second.outs.connect(edge.source.portname, edge.target)
+        parent._storage.erase_edges(outedges)
+        parent_op.outs.chain(second.ins)
         return second
 
     def prettyformat(self) -> str:
@@ -396,9 +424,8 @@ class Region:
 
     def prettyprint(self, pp: PrettyPrinter | None = None):
         if pp is None:
-            pp = PrettyPrinter.make(pp, self._storage)
-        else:
-            pp.assign_port_names(self._storage)
+            pp = PrettyPrinter.get(pp)
+        pp.load_region(self)
         ins = pp.get_ports(self.args)
         outs = pp.get_ports(self.results)
         attrs = self.attrs.opname
@@ -432,6 +459,10 @@ class RegionArguments(PortMap):
         attrs = self._get_storage().get_wrapper(self._region._ref).attrs
         return attrs.ins
 
+    def connect(self, portname, port):
+        source = self._get_port(portname)
+        self._get_storage().connect(source, port)
+
 
 class RegionResults(PortMap):
     _region: Region
@@ -453,6 +484,10 @@ class RegionResults(PortMap):
     def _get_attr_ports(self) -> tuple[str]:
         attrs = self._get_storage().get_wrapper(self._region._ref).attrs
         return attrs.outs
+
+    def connect(self, portname, port):
+        target = self._get_port(portname)
+        self._get_storage().connect(port, target)
 
 
 class RegionBody:
@@ -497,17 +532,28 @@ class RegionBody:
             pending = putback
         return results
 
+    def toposorted_ports(self) -> list[Port]:
+        # Requires dictionary to be ordered
+        port_order: dict[Port, int] = {}
+
+        def assign_order(port):
+            port_order.setdefault(port, len(port_order))
+
+        for port in self._region.args.list_ports():
+            assign_order(port)
+
+        for op in self.toposorted_ops():
+            for port in op.ins.list_ports() + op.outs.list_ports():
+                assign_order(port)
+
+        for port in self._region.results.list_ports():
+            assign_order(port)
+
+        return list(port_order.keys())
+
 
 @dataclass(frozen=True)
 class RegionOp(OpNode):
-    @property
-    def ins(self):
-        return InputPorts(self._ref)
-
-    @property
-    def outs(self):
-        return OutputPorts(self._ref)
-
     @property
     def subregion(self) -> "Region":
         gs = self._ref.storage()
@@ -520,7 +566,7 @@ class RegionOp(OpNode):
         pass
 
     def prettyprint(self, pp: PrettyPrinter | None = None):
-        pp = PrettyPrinter.make(pp, self._ref.storage())
+        pp = PrettyPrinter.get(pp)
         ins = pp.get_ports(self.ins)
         outs = pp.get_ports(self.outs)
         pp.println(f"{ins} -> {outs} =>")
@@ -530,16 +576,9 @@ class RegionOp(OpNode):
 
 @dataclass(frozen=True)
 class SimpleOp(OpNode):
-    @property
-    def ins(self):
-        return InputPorts(self._ref)
-
-    @property
-    def outs(self):
-        return OutputPorts(self._ref)
 
     def prettyprint(self, pp: PrettyPrinter | None = None):
-        pp = PrettyPrinter.make(pp, self._ref.storage())
+        pp = PrettyPrinter.get(pp)
         ins = pp.get_ports(self.ins)
         outs = pp.get_ports(self.outs)
         attrs = self.attrs.opname
@@ -558,7 +597,9 @@ class NodeAttrs:
         try:
             return self.extras[k]
         except KeyError:
-            raise AttributeError(k)
+            exc = AttributeError(k)
+            exc.add_note(f"from look up in {self}")
+            raise exc
 
     def __deepcopy__(self, memo) -> "NodeAttrs":
         return self.__class__(
@@ -689,6 +730,7 @@ class GraphStorage:
         # share the same NodeAttrs
         self._nodes[ref] = attrs = subregion._storage._nodes[subregion._ref]
         attrs.extras["region"] = subregion
+        attrs.extras["parent"] = ref
         return ref
 
     def add_cloned_subregion(self, subregion) -> _Ref:
@@ -696,6 +738,7 @@ class GraphStorage:
         # share the same NodeAttrs
         self._nodes[ref] = attrs = subregion._storage._nodes[subregion._ref]
         attrs.extras["region"] = subregion
+        attrs.extras["parent"] = ref
         return ref
 
     def get_root_region(self) -> _Ref:
@@ -871,12 +914,15 @@ class GraphStorage:
         self._edges.extend(remain_edges)
         return _DanglingEdges(dead_target=dead_target, dead_source=dead_source)
 
+    def erase_edges(self, edges):
+        for edge in edges:
+            self._edges.remove(edge)
+
     def check_edge(self, edge: Edge) -> bool:
         return all((
             edge.source.ref.storage() is self,
             edge.source.ref.storage() is self,
         ))
-
 
     def connect(self, source: Port, target: Port):
         if source.ref.storage() is not target.ref.storage():
@@ -897,10 +943,9 @@ class GraphStorage:
         attrs.outs.append(portname)
         return Port(ref, portname, "out")
 
-    def assign_port_names(self, varnamer: VariableNamer):
-        varnamer.load_edges(self._edges)
-
     def get_wrapper(self, ref: _Ref) -> "OpNode":
+        if ref not in self._nodes:
+            raise OrphanNodeError(ref)
         attrs = self._nodes[ref]
         return attrs.op_type(ref)
 
@@ -915,15 +960,19 @@ class GraphStorage:
 
 
 class RVSDGError(Exception):
-    """Any error related to the RVSDGraph container and operations
+    """Any error related to the RVSDGraph structure and operations
     """
-
 
 class MalformOperationError(RVSDGError):
     pass
 
-class MalformContainerError(RVSDGError):
+class MalformGraphError(RVSDGError):
     pass
 
-class InvalidPortNameError(RVSDGError):
+
+class OrphanNodeError(MalformGraphError):
+    pass
+
+
+class InvalidPortNameError(MalformOperationError):
     pass
