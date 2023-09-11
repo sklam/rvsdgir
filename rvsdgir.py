@@ -32,7 +32,7 @@ def _type_expect(obj: Any, _expected: Type[T]) -> T:
 
 @dataclass(frozen=True, order=True)
 class _Ref:
-    storage: weakref.ReferenceType["GraphStorage"] = field(
+    _weak_storage_ref: weakref.ReferenceType["GraphStorage"] = field(
         hash=False, repr=False
     )  # for GraphStorage
     ident: int
@@ -40,6 +40,12 @@ class _Ref:
     @classmethod
     def make(cls, storage: "GraphStorage", ident: int) -> "_Ref":
         return _Ref(weakref.ref(storage), ident)
+
+    def storage(self) -> "GraphStorage":
+        obj = self._weak_storage_ref()
+        if obj is None:
+            raise MalformGraphError("Node reference points to deleted storage")
+        return obj
 
     def __repr__(self) -> str:
         gs = self.storage()
@@ -238,7 +244,7 @@ class PrettyPrinter:
     def println(self, *args):
         print(self.indent, *args, file=self.file)
 
-    def get_ports(self, portmap: PortMap) -> tuple[str]:
+    def get_ports(self, portmap: PortMap) -> str:
         ports = portmap.list_ports()
         names = [f"{v.portname}={self._varnamer.get(v)}" for v in ports]
         combined = ", ".join(names)
@@ -363,9 +369,6 @@ class Region:
             raise MalformOperationError("Region has no parent")
         return Region(parent, parent.get_root_region())
 
-    def get_regionop(self) -> "RegionOp":
-        return self._storage.get_parent_regionop(self._ref)
-
     def add_subregion(
         self, opname: str, ins: Sequence[str], outs: Sequence[str], **kwargs
     ) -> "RegionOp":
@@ -374,7 +377,7 @@ class Region:
 
     def add_simple_op(
         self, opname: str, ins: Sequence[str], outs: Sequence[str], **kwargs
-    ) -> "RegionOp":
+    ) -> "SimpleOp":
         ref = self._storage.add_node(
             opname, ins, outs, op_type=SimpleOp, **kwargs
         )
@@ -497,11 +500,11 @@ class RegionBody:
     def __init__(self, region: Region):
         self._region = region
 
-    def __iter__(self) -> Iterable[OpNode]:
+    def __iter__(self) -> Iterator[OpNode]:
         gs = self._region._storage
         return iter((gs.get_wrapper(ref) for ref in gs.iter_nodes()))
 
-    def iter_ops_unordered(self) -> Iterable[OpNode]:
+    def iter_ops_unordered(self) -> Iterator[OpNode]:
         return iter(self)
 
     def toposorted_ops(self) -> list[OpNode]:
@@ -619,9 +622,6 @@ class Edge:
 
     def is_connecting_with(self, port: Port):
         return self.source == port or self.target == port
-
-    def move(self, repl: Mapping[_Ref, _Ref]) -> "Edge":
-        return Edge(self.source.move(repl), self.target.move(repl))
 
     def replace(self, **kwargs):
         return replace(self, **kwargs)
