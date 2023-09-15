@@ -13,7 +13,6 @@ from typing import (
     Self,
     # Mapping,
     Tuple,
-
 )
 from collections.abc import Sequence, Set, Iterator, Mapping
 from collections import defaultdict
@@ -84,7 +83,6 @@ class PortMap(Mapping, ABC):
 
     def __getattr__(self, name: str) -> Port:
         return self._get_port(name)
-
 
     def list_ports(self) -> list[Port]:
         return [
@@ -175,7 +173,6 @@ class OutputPorts(PortMap):
         self._get_storage().connect(source, port)
 
 
-
 def _forever_counter():
     n = 0
     while True:
@@ -195,11 +192,18 @@ class VariableNamer:
         name = f"${n}"
         return name
 
-    def load_body(self, ordered_ports: Sequence["Port"], edges: Sequence["Edge"]):
+    def load_body(
+        self, ordered_ports: Sequence["Port"], edges: Sequence["Edge"]
+    ):
         port_order = dict(zip(ordered_ports, range(len(ordered_ports))))
         MISSING = len(port_order)
-        edges = sorted(edges, key=lambda x: (port_order.get(x.target, MISSING),
-                                             port_order.get(x.source, MISSING)))
+        edges = sorted(
+            edges,
+            key=lambda x: (
+                port_order.get(x.target, MISSING),
+                port_order.get(x.source, MISSING),
+            ),
+        )
         # Find aliases
         alias: dict[Port, Port] = {}
         for edge in edges:
@@ -209,11 +213,17 @@ class VariableNamer:
                 # only live ports
                 alias[dst] = alias.get(src, src)
         # Assign names
+        port_conns: dict[Port, set[Port]] = defaultdict(set)
         for port in port_order:
             aliased = alias.get(port, port)
-            if aliased not in self._names:
-                self._names[aliased] = self._fresh_name()
-            self._names[port] = self._names[aliased]
+            port_conns[aliased].add(port)
+
+        for portset in port_conns.values():
+            if len(portset) > 1:
+                name = self._fresh_name()
+                for p in portset:
+                    self._names[p] = name
+
 
     def get(self, port: Port) -> str:
         return self._names.get(port, "?")
@@ -238,8 +248,9 @@ class PrettyPrinter:
         self._varnamer = varnamer
 
     def load_region(self, region):
-        self._varnamer.load_body(region.body.toposorted_ports(),
-                                 region._storage._edges)
+        self._varnamer.load_body(
+            region.body.toposorted_ports(), region._storage._edges
+        )
 
     def println(self, *args):
         print(self.indent, *args, file=self.file)
@@ -267,7 +278,6 @@ class OpNode:
     @property
     def outs(self):
         return OutputPorts(self._ref)
-
 
     def prettyprint(self, pp: PrettyPrinter):
         raise NotImplementedError
@@ -345,7 +355,6 @@ class Region:
         ret._ref = ref
         return ret
 
-
     @property
     def attrs(self):
         gs = self._ref.storage()
@@ -388,6 +397,9 @@ class Region:
         ref = self._storage.add_cloned_subregion(cloned)
         return RegionOp(ref)
 
+    def clone(self) -> "Region":
+        return deepcopy(self)
+
     def split_after(self, op: OpNode) -> "RegionOp":
         """Split the region after the given ``OpNode`` returning the new
         second RegionOp.
@@ -396,16 +408,22 @@ class Region:
         # Split the ops
         topo_ops = self.body.toposorted_ops()
         idx = topo_ops.index(op)
-        before_ops = topo_ops[:idx + 1]
-        after_ops = topo_ops[idx + 1:]
+        before_ops = topo_ops[: idx + 1]
+        after_ops = topo_ops[idx + 1 :]
         parent = self.get_parent()
 
         parent_op = parent._storage.get_wrapper(self.attrs.parent)
-        outedges = list(parent._storage.iter_edges().filter_by_source(set(parent_op.outs.list_ports())))
+        outedges = list(
+            parent._storage.iter_edges().filter_by_source(
+                set(parent_op.outs.list_ports())
+            )
+        )
 
         second = parent.add_subregion(
-            opname=self.attrs.opname, ins=(), outs=(),
-            )
+            opname=self.attrs.opname,
+            ins=(),
+            outs=(),
+        )
 
         first_half = {x._ref for x in before_ops}
         second_half = {x._ref for x in after_ops}
@@ -579,7 +597,6 @@ class RegionOp(OpNode):
 
 @dataclass(frozen=True)
 class SimpleOp(OpNode):
-
     def prettyprint(self, pp: PrettyPrinter | None = None):
         pp = PrettyPrinter.get(pp)
         ins = pp.get_ports(self.ins)
@@ -614,7 +631,6 @@ class NodeAttrs:
         )
 
 
-
 @dataclass(frozen=True, order=True)
 class Edge:
     source: Port
@@ -625,7 +641,6 @@ class Edge:
 
     def replace(self, **kwargs):
         return replace(self, **kwargs)
-
 
 
 class EdgeIterator:
@@ -693,20 +708,18 @@ class GraphStorage:
     _edges: list[Edge] = field(default_factory=list)
 
     def __deepcopy__(self, memo) -> "GraphStorage":
-        cls = self.__class__
-        ret = cls.__new__(cls)
-        memo[id(self)] = ret
-
         gs = self.__class__()
         repl = {}
+        memo[id(self)] = gs
         for ref, attrs in self._nodes.items():
-            newref = gs._refheap.alloc(self)
+            newref = gs._refheap.alloc(gs)
             gs._nodes[newref] = deepcopy(attrs, memo)
             repl[ref] = newref
         for name, ref in self._sentinels.items():
             gs._sentinels[name] = repl[ref]
         for edge in self._edges:
-            gs._edges.append(edge)
+            gs._edges.append(Edge(source=edge.source.replace(ref=repl[edge.source.ref]),
+                                  target=edge.target.replace(ref=repl[edge.target.ref])))
         return gs
 
     def add_node(self, opname, ins, outs, op_type, **kwargs) -> _Ref:
@@ -766,7 +779,10 @@ class GraphStorage:
     def split(self, first: Set[_Ref], second: Set[_Ref], newregion: "Region"):
         newgs = newregion._storage
 
-        first_nodes = [*self._sentinels.values(), *(ref for ref in self._nodes if ref in first)]
+        first_nodes = [
+            *self._sentinels.values(),
+            *(ref for ref in self._nodes if ref in first),
+        ]
         second_nodes = [ref for ref in self._nodes if ref in second]
         diff = set(first_nodes).union(second_nodes).difference(self._nodes)
         if diff:
@@ -801,7 +817,14 @@ class GraphStorage:
             elif source_in_second and target_in_second:
                 second_edges.append(edge)
             else:
-                if not any((source_in_first, source_in_second, target_in_first, target_in_second)):
+                if not any(
+                    (
+                        source_in_first,
+                        source_in_second,
+                        target_in_first,
+                        target_in_second,
+                    )
+                ):
                     sentinel_only_edges.append(edge)
                 else:
                     if source_in_first:
@@ -817,12 +840,14 @@ class GraphStorage:
         # --- Fixup first partition's edges ---
         self._edges.clear()
         self._edges.extend(first_edges)
-        self._edges.extend(first_in_edges) # use these unchanged
+        self._edges.extend(first_in_edges)  # use these unchanged
 
         this_ref = self.get_root_region()
         this_attrs = self.get_attrs(this_ref)
 
-        old_result_ports = tuple(Port(this_ref, x, kind="result") for x in this_attrs.outs)
+        old_result_ports = tuple(
+            Port(this_ref, x, kind="result") for x in this_attrs.outs
+        )
 
         this_attrs.outs.clear()
 
@@ -841,7 +866,9 @@ class GraphStorage:
         for edge in first_out_edges:
             if edge.target not in first_newports:
                 # allocate new port
-                first_newports[edge.target] = self.append_output_port(this_ref, f"_redir_{len(first_newports)}")
+                first_newports[edge.target] = self.append_output_port(
+                    this_ref, f"_redir_{len(first_newports)}"
+                )
             newport = first_newports[edge.target].replace(kind="result")
             self.connect(edge.source, newport)
             redir_args.append((edge.source, newport))
@@ -851,12 +878,16 @@ class GraphStorage:
         other_ref = newgs.get_root_region()
 
         for i, portname in enumerate(this_attrs.outs):
-            newport = newgs.append_input_port(other_ref, portname).replace(kind="arg")
+            newport = newgs.append_input_port(other_ref, portname).replace(
+                kind="arg"
+            )
             inport, _ = redir_args[i]
             portmap[inport] = newport
 
         for port in old_result_ports:
-            newport = newgs.append_output_port(other_ref, port.portname).replace(kind="result")
+            newport = newgs.append_output_port(
+                other_ref, port.portname
+            ).replace(kind="result")
             portmap[port] = newport
 
         for edge in second_edges:
@@ -880,7 +911,9 @@ class GraphStorage:
         for edge in sentinel_only_edges:
             newgs.connect(portmap[edge.source], portmap[edge.target])
 
-    def copy_nodes(self, source_graph: Self, nodes: Iterable[_Ref]) -> dict[_Ref, _Ref]:
+    def copy_nodes(
+        self, source_graph: Self, nodes: Iterable[_Ref]
+    ) -> dict[_Ref, _Ref]:
         """Copy nodes from another storage and return a ref mapping.
         Edges are not copied nor fixed up.
         """
@@ -919,16 +952,20 @@ class GraphStorage:
             self._edges.remove(edge)
 
     def check_edge(self, edge: Edge) -> bool:
-        return all((
-            edge.source.ref.storage() is self,
-            edge.source.ref.storage() is self,
-        ))
+        return all(
+            (
+                edge.source.ref.storage() is self,
+                edge.source.ref.storage() is self,
+            )
+        )
 
     def connect(self, source: Port, target: Port):
         if source.ref.storage() is not target.ref.storage():
             raise MalformOperationError("Ports must be from same GraphStorage")
         if source.ref.storage() is not self:
-            raise MalformOperationError("Ports do not belong to this GraphStorage")
+            raise MalformOperationError(
+                "Ports do not belong to this GraphStorage"
+            )
         self._edges.append(Edge(source, target))
 
     def append_input_port(self, ref: _Ref, portname: str) -> Port:
@@ -960,11 +997,12 @@ class GraphStorage:
 
 
 class RVSDGError(Exception):
-    """Any error related to the RVSDGraph structure and operations
-    """
+    """Any error related to the RVSDGraph structure and operations"""
+
 
 class MalformOperationError(RVSDGError):
     pass
+
 
 class MalformGraphError(RVSDGError):
     pass

@@ -153,6 +153,7 @@ def test_copy_in():
     assert all(isinstance(x, RegionOp) for x in module_reg.body)
     assert not check_overlap_refs(module_reg, func1, func2)
 
+
 def test_split():
     parent_reg = Region.make("func")
     func_reg = parent_reg.add_subregion(
@@ -216,13 +217,115 @@ def test_split():
     func_reg.outs.chain(sink_op.ins)
     parent_reg.prettyprint()
 
+    # Keep copy of the graph
+    orig_str = parent_reg.prettyformat()
+    orig_copy = parent_reg.clone()
+
+    print("pre-split clone".center(80, "-"))
+    print(orig_copy.prettyformat())
+    print(orig_str)
+    assert orig_copy.prettyformat() == orig_str
+
     # Split region
     ops = list(func_reg.subregion.body.toposorted_ops())
     splitted = func_reg.subregion.split_after(ops[1])
 
-    parent_reg.prettyprint()
+    assert isinstance(splitted, RegionOp)
 
-    assert False
+    print("splitted region".center(80, "-"))
+    got = parent_reg.prettyformat().strip()
+    print(got)
+    expected = """
+ Region[func] () -> () {
+   Op Source () -> (env=$1, val=$2)
+   (env=$1, arg=$2) -> (_redir_env=$3, _redir_arg=$4, _redir_0=$5, _redir_1=$6) =>
+     Region[func] (env=$9, arg=$10) -> (_redir_env=$9, _redir_arg=$10, _redir_0=$12, _redir_1=$11) {
+       Op BinAdd1 (lhs=$10, rhs=$10) -> (out=$11)
+       Op BinMul1 (lhs=$11, rhs=$10) -> (out=$12)
+     }
+   (_redir_env=$3, _redir_arg=$4, _redir_0=$5, _redir_1=$6) -> (env=$7, ret=$8) =>
+     Region[func] (_redir_env=$13, _redir_arg=$14, _redir_0=$15, _redir_1=$16) -> (env=$13, ret=$18) {
+       Op BinAdd2 (lhs=$14, rhs=$15) -> (out=$17)
+       Op BinMul2 (lhs=$16, rhs=$17) -> (out=$18)
+     }
+   Op Sink (env=$7, val=$8) -> ()
+ }
+""".strip()
+    assert got == expected
+
+
+    print("post-split clone".center(80, "-"))
+    print(orig_copy.prettyformat())
+    print(orig_str)
+    assert orig_copy.prettyformat() == orig_str
+
+
+def test_clone():
+    parent_reg = Region.make("func", ins=("a", "b"), outs=["c"])
+    add = parent_reg.add_simple_op("Add", ins=["a", "b"], outs=["c"])
+    add.ins(a=parent_reg.args.a, b=parent_reg.args.b)
+    parent_reg.results(c=add.outs.c)
+
+    orig_str = parent_reg.prettyformat()
+
+    cloned_reg = parent_reg.clone()
+
+    add = parent_reg.add_simple_op("Sub", ins=["a", "b"], outs=["c"])
+    add.ins(a=parent_reg.args.a, b=add.outs.c)
+
+    changed_str = parent_reg.prettyformat()
+    cloned_str = cloned_reg.prettyformat()
+    assert cloned_str == orig_str
+    assert changed_str != cloned_str
+
+def test_clone_nested():
+    module_reg = Region.make("func", ins=(), outs=())
+    parent_regop = module_reg.add_subregion("func", ins=("a", "b"), outs=["c"])
+    parent_reg = parent_regop.subregion
+    add = parent_reg.add_simple_op("Add", ins=["a", "b"], outs=["c"])
+    add.ins(a=parent_reg.args.a, b=parent_reg.args.b)
+    parent_reg.results(c=add.outs.c)
+
+    orig_str = module_reg.prettyformat()
+    cloned_reg = module_reg.clone()
+
+    sub = parent_reg.add_simple_op("Sub", ins=["a", "b"], outs=["c"])
+    sub.ins(a=parent_reg.args.a, b=add.outs.c)
+    parent_reg.results(c=sub.outs.c)
+
+    changed_str = module_reg.prettyformat()
+    cloned_str = cloned_reg.prettyformat()
+
+    assert cloned_str == orig_str
+    assert changed_str != cloned_str
+    assert changed_str.strip() == """
+ Region[func] () -> () {
+   (a=?, b=?) -> (c=?) =>
+     Region[func] (a=$1, b=$2) -> (c=$4) {
+       Op Add (a=$1, b=$2) -> (c=$3)
+       Op Sub (a=$1, b=$3) -> (c=$4)
+     }
+ }
+ """.strip()
+
+
+def test_pretty_print():
+    module_reg = Region.make("func", ins=(), outs=())
+    parent_regop = module_reg.add_subregion("func", ins=("a", "b"), outs=["c"])
+    parent_reg = parent_regop.subregion
+    add = parent_reg.add_simple_op("Add", ins=["a", "b"], outs=["c"])
+    add.ins(a=parent_reg.args.a, b=parent_reg.args.b)
+    # intentionally not connect the output to test for dead ports
+    orig_str = module_reg.prettyformat().strip()
+    print(orig_str)
+    assert orig_str == """
+Region[func] () -> () {
+   (a=?, b=?) -> (c=?) =>
+     Region[func] (a=$1, b=$2) -> (c=?) {
+       Op Add (a=$1, b=$2) -> (c=?)
+     }
+ }""".strip()
+
 
 if __name__ == "__main__":
-    test_split()
+    test_pretty_print()
